@@ -2,7 +2,6 @@ import { Request, Response } from 'express';
 import {
   LoginDTO,
   LoginSchema,
-  RefreshTokenSchema,
   SignUpDTO,
   SignUpSchema,
 } from '../validators/AuthValidator';
@@ -10,16 +9,23 @@ import { ZodError } from 'zod';
 import { userService } from '../services/UserService';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import { User } from '../models/user';
-import UserTransformer from '../helpers/UserTransformer';
 import { jwt_refresh_secret, jwt_secret } from '..';
+import { RefreshTokenModel } from '../models/refreshToken';
 import tokenGenerator from '../helpers/TokenGenerator';
 import { tokenService } from '../services/TokenService';
+import UserTransformer from '../helpers/UserTransformer';
 
-export default class AuthController {
-  public static async signup(req: Request, res: Response): Promise<any> {
+class authController {
+  public static _instance: authController;
+  public static getInstance(): authController {
+    if (!this._instance) {
+      this._instance = new authController();
+    }
+    return this._instance;
+  }
+
+  public async signup(req: Request, res: Response): Promise<any> {
     let data: SignUpDTO = req.body;
-
     try {
       data = SignUpSchema.parse(data);
     } catch (error: any) {
@@ -61,7 +67,7 @@ export default class AuthController {
       .json({ user: UserTransformer(user), token: authToken });
   }
 
-  public static async login(req: Request, res: Response): Promise<any> {
+  public async login(req: Request, res: Response): Promise<any> {
     let data: LoginDTO = req.body;
 
     try {
@@ -79,7 +85,7 @@ export default class AuthController {
     const user = await userService.getUserByEmail(data.email);
 
     if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+      return res.status(404).json({ message: 'User Not found' });
     }
 
     const isPasswordCorrect = await bcrypt.compare(
@@ -98,11 +104,11 @@ export default class AuthController {
     const hashedToken = await bcrypt.hash(refreshToken, 10);
 
     if (dbRefreshToken) {
-      await tokenService.deleteRefreshToken(user.email);
-      await tokenService.createRefreshToken(hashedToken, user);
-    } else {
-      await tokenService.createRefreshToken(hashedToken, user);
+      await RefreshTokenModel.findByIdAndDelete(dbRefreshToken._id);
     }
+
+    await tokenService.createRefreshToken(hashedToken, user);
+
     res
       .cookie('refreshToken', refreshToken, {
         httpOnly: true,
@@ -113,74 +119,58 @@ export default class AuthController {
       .json({ user: UserTransformer(user), token: authToken });
   }
 
-  public static async refreshToken(req: Request, res: Response): Promise<any> {
-    let data = req.cookies;
+  public async refreshToken(req: Request, res: Response) {
     try {
-      data = RefreshTokenSchema.parse(data);
-    } catch (e: any) {
-      if (e instanceof ZodError) {
-        return res.status(403).json({ message: e.errors[0]?.message });
-      } else {
-        return res
-          .status(403)
-          .json({ message: `Unexpected error occurred : ${e.message}` });
+      const data = req.cookies;
+
+      const decodedData = jwt.verify(data.refreshToken, jwt_refresh_secret) as {
+        email: string;
+        first_name: string;
+      };
+
+      const user = await userService.getUserByEmail(decodedData.email);
+
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
       }
+
+      const dbRefreshToken = await tokenService.getRefreshToken(user.email);
+
+      if (!dbRefreshToken) {
+        return res.status(404).json({ message: 'Refresh token not found' });
+      }
+
+      const isValid = await bcrypt.compare(
+        data.refreshToken,
+        dbRefreshToken.refreshTokenHash
+      );
+
+      if (!isValid) {
+        return res.status(403).json({ message: 'Invalid refresh token' });
+      }
+
+      const { authToken, refreshToken } = tokenGenerator(user);
+
+      const hashedToken = await bcrypt.hash(refreshToken, 10);
+
+      await tokenService.deleteRefreshToken(user.email);
+
+      await tokenService.createRefreshToken(hashedToken, user);
+
+      res
+        .cookie('refreshToken', refreshToken, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          path: '/auth/refresh',
+          maxAge: 1000 * 60 * 60 * 24 * 90,
+        })
+        .json({ token: authToken });
+    } catch (e) {
+      return res.status(401).json({ message: 'Invalid token' });
     }
-
-    jwt.verify(
-      data.refreshToken,
-      jwt_refresh_secret,
-      async (err: any, decoded: any) => {
-        if (err) {
-          if (err.name === 'TokenExpiredError') {
-            return res.status(401).json({ message: 'Refresh token expired' });
-          }
-          return res
-            .status(403)
-            .json({ message: 'Error while verifying token' });
-        }
-
-        const { email } = decoded as Partial<User>;
-        const user = await userService.getUserByEmail(email!);
-        if (!user) {
-          return res.status(404).json({ message: 'User not found' });
-        }
-
-        const dbRefreshToken = await tokenService.getRefreshToken(user.email);
-
-        if (!dbRefreshToken) {
-          return res.status(404).json({ message: 'Refresh token not found' });
-        }
-
-        const isValid = await bcrypt.compare(
-          data.refreshToken,
-          dbRefreshToken.refreshTokenHash
-        );
-
-        if (!isValid) {
-          return res.status(403).json({ message: 'Invalid refresh token' });
-        }
-
-        const { authToken, refreshToken } = tokenGenerator(user);
-
-        const hashedToken = await bcrypt.hash(refreshToken, 10);
-
-        if (dbRefreshToken) {
-          await tokenService.deleteRefreshToken(user.email);
-          await tokenService.createRefreshToken(hashedToken, user);
-        } else {
-          await tokenService.createRefreshToken(hashedToken, user);
-        }
-
-        res
-          .cookie('refreshToken', refreshToken, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            path: '/auth/refresh',
-            maxAge: 1000 * 60 * 60 * 24 * 90,
-          })
-          .json({ token: authToken });
-      }
-    );
   }
 }
+
+const AuthController = authController.getInstance();
+
+export default AuthController;
